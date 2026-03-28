@@ -1,170 +1,283 @@
 import os
 import asyncio
 import logging
-import psutil
-import time
-import httpx
-import socket
-from datetime import datetime, timedelta
-from logging.handlers import RotatingFileHandler
-from typing import Dict, List, Optional
+import base64
+from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
-
-# Імпортуємо BaseMiddleware, який був пропущений раніше
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.filters import Command
 from aiogram.types import (
-    Message, CallbackQuery, 
-    InlineKeyboardButton, InlineKeyboardMarkup
+    Message, CallbackQuery,
+    InlineKeyboardButton
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ════════════════════════════════════════
-# 1. КОНФІГУРАЦІЯ (З .env ТА FALLBACKS)
+# 1. КОНФІГУРАЦІЯ
 # ════════════════════════════════════════
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s'
+)
+logger = logging.getLogger("AI-BOT")
+
 load_dotenv()
+BOT_TOKEN     = os.getenv("BOT_TOKEN")
+ADMIN_ID      = int(os.getenv("ADMIN_ID", 0))
+ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
 
-class Config:
-    TOKEN = os.getenv("BOT_TOKEN")
-    ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
-    # Нові параметри з .env
-    THROTTLE_SEC = float(os.getenv("THROTTLE_SEC", 1.0))
-    NET_INTERFACE = os.getenv("NET_INTERFACE", "eth0")
-    ALERT_COOLDOWN = int(os.getenv("ALERT_COOLDOWN_SEC", 300))
-
-if not Config.TOKEN or not Config.ADMIN_ID:
-    print("CRITICAL: Check your Environment Variables (BOT_TOKEN/ADMIN_ID)!")
+if not BOT_TOKEN or not ADMIN_ID or not ANTHROPIC_KEY:
+    logger.error("Перевірте .env: BOT_TOKEN, ADMIN_ID, ANTHROPIC_API_KEY")
     exit(1)
 
-# ════════════════════════════════════════
-# 2. MIDDLEWARE (АВТОРИЗАЦІЯ ТА ТРОТЛІНГ)
-# ════════════════════════════════════════
-class SherlockGuard(BaseMiddleware):
-    def __init__(self):
-        super().__init__()
-        self.last_action = {}
+claude = AsyncAnthropic(api_key=ANTHROPIC_KEY)
 
+# ════════════════════════════════════════
+# 2. СТАН КОРИСТУВАЧА (пам'ять чату)
+# ════════════════════════════════════════
+# Зберігаємо режим і історію розмови
+user_mode: dict[int, str] = {}      # chat / translate / summarize
+user_history: dict[int, list] = {}  # історія повідомлень для контексту
+
+MAX_HISTORY = 10  # максимум повідомлень в пам'яті
+
+def get_mode(uid: int) -> str:
+    return user_mode.get(uid, "chat")
+
+def add_to_history(uid: int, role: str, content):
+    if uid not in user_history:
+        user_history[uid] = []
+    user_history[uid].append({"role": role, "content": content})
+    # Обрізаємо якщо занадто довга
+    if len(user_history[uid]) > MAX_HISTORY:
+        user_history[uid] = user_history[uid][-MAX_HISTORY:]
+
+def clear_history(uid: int):
+    user_history[uid] = []
+
+# ════════════════════════════════════════
+# 3. MIDDLEWARE
+# ════════════════════════════════════════
+class AuthMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
-        user = getattr(event, "from_user", None)
-        # Виправлено: звернення через user.id, а не user_id
-        if not user or user.id != Config.ADMIN_ID:
+        uid = getattr(event, "from_user", None)
+        if uid is None or uid.id != ADMIN_ID:
             return
-
-        # Throttle logic з використанням time.monotonic()
-        now = time.monotonic()
-        if user.id in self.last_action:
-            if now - self.last_action[user.id] < Config.THROTTLE_SEC:
-                if isinstance(event, CallbackQuery):
-                    await event.answer("⏳ Зачекайте, Шерлок думає...", show_alert=False)
-                return
-        
-        self.last_action[user.id] = now
         return await handler(event, data)
 
 # ════════════════════════════════════════
-# 3. СЕРВІСНИЙ МОДУЛЬ (ДЕТЕКТИВ)
+# 4. CLAUDE API ВИКЛИКИ
 # ════════════════════════════════════════
-class SystemService:
-    @staticmethod
-    async def get_osint_data(nick: str) -> str:
-        targets = {
-            "GitHub": f"https://github.com/{nick}",
-            "Twitter": f"https://twitter.com/{nick}",
-            "Reddit": f"https://reddit.com/user/{nick}",
-            "Telegram": f"https://t.me/{nick}"
-        }
-        found = []
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-            for name, url in targets.items():
-                try:
-                    r = await client.get(url)
-                    if r.status_code == 200:
-                        found.append(f"✅ {name}: {url}")
-                except: continue
-        return "\n".join(found) if found else "Нічого не знайдено."
+SYSTEM_PROMPTS = {
+    "chat": (
+        "Ти корисний AI асистент. Відповідай українською мовою якщо не просять інакше. "
+        "Будь лаконічним але повним у відповідях."
+    ),
+    "translate": (
+        "Ти перекладач. Твоя єдина задача — перекласти наданий текст. "
+        "Визнач мову тексту автоматично і перекладай на українську. "
+        "Якщо текст вже українською — переклади на англійську. "
+        "Відповідай ТІЛЬКИ перекладом, без пояснень."
+    ),
+    "summarize": (
+        "Ти експерт з аналізу тексту. Твоя задача — стиснути наданий текст або переписку. "
+        "Виділи: головну думку, ключові факти, важливі деталі. "
+        "Відповідай українською мовою, структуровано."
+    ),
+}
 
-    @staticmethod
-    def get_stats_report():
-        cpu = psutil.cpu_percent()
-        ram = psutil.virtual_memory().percent
-        
-        # Graceful fallback для Load Average (немає на Windows)
-        try:
-            la = os.getloadavg()
-            la_str = f"{la[0]} {la[1]} {la[2]}"
-        except:
-            la_str = "N/A"
+async def ask_claude(uid: int, text: str) -> str:
+    mode = get_mode(uid)
+    system = SYSTEM_PROMPTS[mode]
 
-        # Graceful fallback для температури
-        temp_str = "N/A"
-        try:
-            temps = psutil.sensors_temperatures()
-            if temps:
-                for name, entries in temps.items():
-                    temp_str = f"{entries[0].current}°C"
-                    break
-        except: pass
+    add_to_history(uid, "user", text)
 
-        uptime = str(timedelta(seconds=int(time.time() - psutil.boot_time())))
-        return (
-            f"📊 **ЗВІТ СИСТЕМИ**\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"🖥️ CPU: `{cpu}%` ({temp_str})\n"
-            f"🧠 RAM: `{ram}%`\n"
-            f"📈 Load: `{la_str}`\n"
-            f"⏱️ Uptime: `{uptime}`\n"
-            f"📡 Interface: `{Config.NET_INTERFACE}`"
+    try:
+        response = await claude.messages.create(
+            model="claude-haiku-4-5-20251001",  # найшвидша і найдешевша модель
+            max_tokens=1024,
+            system=system,
+            messages=user_history[uid]
         )
+        reply = response.content[0].text
+        add_to_history(uid, "assistant", reply)
+        return reply
+    except Exception as e:
+        logger.error(f"Claude API error: {e}")
+        return f"⚠️ Помилка API: {str(e)[:100]}"
+
+async def analyze_photo(uid: int, image_data: bytes, mime: str, caption: str = "") -> str:
+    prompt = caption if caption else "Детально опиши що зображено на цьому фото. Якщо є текст — прочитай його."
+    
+    try:
+        response = await claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
+            system="Ти AI асистент що аналізує зображення. Відповідай українською мовою.",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": mime,
+                            "data": base64.standard_b64encode(image_data).decode("utf-8")
+                        }
+                    },
+                    {"type": "text", "text": prompt}
+                ]
+            }]
+        )
+        return response.content[0].text
+    except Exception as e:
+        logger.error(f"Photo analysis error: {e}")
+        return f"⚠️ Помилка аналізу фото: {str(e)[:100]}"
 
 # ════════════════════════════════════════
-# 4. ІНТЕРФЕЙС ТА ХЕНДЛЕРИ
+# 5. КЛАВІАТУРИ
 # ════════════════════════════════════════
-bot = Bot(token=Config.TOKEN)
-dp = Dispatcher()
-# Підключаємо middleware для обох типів подій
-dp.message.middleware(SherlockGuard())
-dp.callback_query.middleware(SherlockGuard())
+def main_kb(uid: int):
+    mode = get_mode(uid)
+    b = InlineKeyboardBuilder()
+    
+    # Кнопки режимів з позначкою активного
+    b.row(
+        InlineKeyboardButton(
+            text=f"{'✅' if mode == 'chat' else '💬'} Чат",
+            callback_data="mode_chat"
+        ),
+        InlineKeyboardButton(
+            text=f"{'✅' if mode == 'translate' else '🌐'} Переклад",
+            callback_data="mode_translate"
+        ),
+        InlineKeyboardButton(
+            text=f"{'✅' if mode == 'summarize' else '📝'} Підсумок",
+            callback_data="mode_summarize"
+        )
+    )
+    b.row(InlineKeyboardButton(text="🗑 Очистити пам'ять", callback_data="clear_history"))
+    return b.as_markup()
 
-def main_menu():
-    kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text="🕵️ OSINT Пробиття", callback_data="do_osint"))
-    kb.row(InlineKeyboardButton(text="📊 Метрики", callback_data="get_stats"))
-    kb.row(InlineKeyboardButton(text="❤️ Health Check", callback_data="health"))
-    kb.row(InlineKeyboardButton(text="🔌 Off", callback_data="shutdown"))
-    return kb.as_markup()
+# ════════════════════════════════════════
+# 6. БОТ + ХЕНДЛЕРИ
+# ════════════════════════════════════════
+bot = Bot(token=BOT_TOKEN)
+dp  = Dispatcher()
+
+auth = AuthMiddleware()
+dp.message.middleware(auth)
+dp.callback_query.middleware(auth)
 
 @dp.message(Command("start"))
-async def start(message: Message):
-    await message.answer("🦾 **S47 SHERLOCK ULTIMATE v4.0**\nСистема готова до деплою на Railway.", reply_markup=main_menu())
+async def cmd_start(message: Message):
+    uid = message.from_user.id
+    clear_history(uid)
+    await message.answer(
+        "🤖 **AI Асистент активовано**\n\n"
+        "Просто пиши мені будь-яке питання або надсилай фото.\n\n"
+        "**Режими:**\n"
+        "💬 Чат — звичайна розмова з AI\n"
+        "🌐 Переклад — перекладає текст\n"
+        "📝 Підсумок — стискає довгий текст\n\n"
+        "Вибери режим або просто пиши:",
+        reply_markup=main_kb(uid),
+        parse_mode="Markdown"
+    )
 
-@dp.callback_query(F.data == "get_stats")
-async def cb_stats(cb: CallbackQuery):
-    report = SystemService.get_stats_report()
-    await cb.message.edit_text(report, reply_markup=main_menu(), parse_mode="Markdown")
+@dp.message(Command("menu"))
+async def cmd_menu(message: Message):
+    uid = message.from_user.id
+    mode = get_mode(uid)
+    mode_names = {"chat": "💬 Чат", "translate": "🌐 Переклад", "summarize": "📝 Підсумок"}
+    await message.answer(
+        f"⚙️ **Меню**\nПоточний режим: {mode_names[mode]}",
+        reply_markup=main_kb(uid),
+        parse_mode="Markdown"
+    )
 
-@dp.callback_query(F.data == "health")
-async def cb_health(cb: CallbackQuery):
-    await cb.answer("❤️ Система працює стабільно. Event Loop вільний.", show_alert=True)
-
-@dp.callback_query(F.data == "do_osint")
-async def cb_osint_ask(cb: CallbackQuery):
-    await cb.message.answer("🕵️ Напишіть нікнейм через префікс `?` (напр: `?mark_pro`)")
+# ── Зміна режиму ─────────────────────────
+@dp.callback_query(F.data.startswith("mode_"))
+async def cb_mode(cb: CallbackQuery):
+    uid = cb.from_user.id
+    mode = cb.data.replace("mode_", "")
+    user_mode[uid] = mode
+    
+    mode_names = {"chat": "💬 Чат", "translate": "🌐 Переклад", "summarize": "📝 Підсумок"}
+    mode_hints = {
+        "chat": "Просто пиши своє питання — я відповім.",
+        "translate": "Надішли текст — перекладу на українську (або з української на англійську).",
+        "summarize": "Надішли довгий текст або переписку — зроблю короткий підсумок."
+    }
+    
+    await cb.message.edit_text(
+        f"✅ Режим змінено: **{mode_names[mode]}**\n\n{mode_hints[mode]}",
+        reply_markup=main_kb(uid),
+        parse_mode="Markdown"
+    )
     await cb.answer()
 
-@dp.message(F.text.startswith("?"))
-async def handle_osint(message: Message):
-    nick = message.text[1:].strip()
-    wait = await message.answer(f"🔎 Шерлок аналізує `{nick}`...")
-    res = await SystemService.get_osint_data(nick)
-    await wait.edit_text(f"🔍 **Результати для {nick}:**\n\n{res}", disable_web_page_preview=True)
+# ── Очищення пам'яті ─────────────────────
+@dp.callback_query(F.data == "clear_history")
+async def cb_clear(cb: CallbackQuery):
+    clear_history(cb.from_user.id)
+    await cb.answer("✅ Пам'ять очищена", show_alert=False)
+    await cb.message.edit_text(
+        "🗑 **Пам'ять очищена.**\nПочинаємо розмову з нуля.",
+        reply_markup=main_kb(cb.from_user.id),
+        parse_mode="Markdown"
+    )
 
-@dp.callback_query(F.data == "shutdown")
-async def cb_off(cb: CallbackQuery):
-    await cb.message.edit_text("🔌 Offline.")
-    os._exit(0)
+# ── Фото ─────────────────────────────────
+@dp.message(F.photo)
+async def handle_photo(message: Message):
+    uid = message.from_user.id
+    thinking = await message.answer("🔍 Аналізую фото...")
+    
+    try:
+        # Беремо найкраще фото
+        photo = message.photo[-1]
+        file = await bot.get_file(photo.file_id)
+        file_bytes = await bot.download_file(file.file_path)
+        image_data = file_bytes.read()
+        
+        caption = message.caption or ""
+        result = await analyze_photo(uid, image_data, "image/jpeg", caption)
+        
+        await thinking.delete()
+        await message.answer(f"🖼 **Аналіз фото:**\n\n{result}", parse_mode="Markdown")
+    except Exception as e:
+        await thinking.edit_text(f"⚠️ Помилка: {e}")
 
+# ── Текстові повідомлення ─────────────────
+@dp.message(F.text & ~F.text.startswith("/"))
+async def handle_text(message: Message):
+    uid = message.from_user.id
+    text = message.text
+    
+    mode = get_mode(uid)
+    mode_icons = {"chat": "💬", "translate": "🌐", "summarize": "📝"}
+    
+    thinking = await message.answer(f"{mode_icons[mode]} Обробляю...")
+    
+    reply = await ask_claude(uid, text)
+    
+    try:
+        await thinking.edit_text(reply)
+    except Exception:
+        await thinking.delete()
+        await message.answer(reply)
+
+# ════════════════════════════════════════
+# 7. MAIN
+# ════════════════════════════════════════
 async def main():
+    logger.info("AI Бот запущено.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот зупинено.")
+        
