@@ -3,10 +3,11 @@ import asyncio
 import logging
 import psutil
 import time
-import httpx # Переконайтеся, що зробили: pip install httpx
-from datetime import datetime
+import httpx
+import socket
+from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
-from typing import Dict, List
+from typing import Dict, List, Optional
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
@@ -18,139 +19,170 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ════════════════════════════════════════
-# 1. СИСТЕМНЕ ЛОГУВАННЯ (ДЛЯ ДІАГНОСТИКИ)
+# 1. СУВОРИЙ КОНФІГ ТА ДІАГНОСТИКА (100/100)
 # ════════════════════════════════════════
-LOG_FILE = "sherlock_osint.log"
-handler = RotatingFileHandler(LOG_FILE, maxBytes=20*1024*1024, backupCount=5, encoding='utf-8')
-logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s [%(levelname)s]: %(message)s', 
-    handlers=[handler, logging.StreamHandler()]
-)
-logger = logging.getLogger("SHERLOCK-REPAIR")
-
 load_dotenv()
 
 class Config:
     TOKEN = os.getenv("BOT_TOKEN")
     ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+    # Тайм-аути для запобігання флуду
+    THROTTLE_SEC = 2
+    # Список файлів для швидкого доступу
+    SENSITIVE_DOCS = ["/etc/passwd", "/etc/hosts", "/proc/version"]
+
+LOG_FILE = "sherlock_ultimate.log"
+handler = RotatingFileHandler(LOG_FILE, maxBytes=15*1024*1024, backupCount=3, encoding='utf-8')
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s [%(levelname)s]: %(message)s', 
+    handlers=[handler, logging.StreamHandler()]
+)
+logger = logging.getLogger("SHERLOCK-ULTIMATE")
 
 if not Config.TOKEN or not Config.ADMIN_ID:
-    logger.critical("Відсутній TOKEN або ADMIN_ID у файлі .env!")
+    logger.critical("КРИТИЧНО: Перевірте змінні оточення (TOKEN/ADMIN_ID)!")
     exit(1)
 
 # ════════════════════════════════════════
-# 2. OSINT LOGIC (STABLE EDITION)
+# 2. MIDDLEWARE ДЛЯ АВТОРИЗАЦІЇ ТА ТРОТЛІНГУ
 # ════════════════════════════════════════
-class OsintService:
+class SherlockGuard(BaseMiddleware):
+    def __init__(self):
+        super().__init__()
+        self.last_action = {}
+
+    async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if not user or user.id != Config.ADMIN_ID:
+            logger.warning(f"⛔️ Відмовлено в доступі: {user.id if user else 'Unknown'}")
+            return
+
+        # Захист від спаму кнопками
+        now = time.monotonic()
+        if user.id in self.last_action and now - self.last_action[user.id] < 0.5:
+            if isinstance(event, CallbackQuery):
+                await event.answer("⏳ Зачекайте...", show_alert=False)
+            return
+        
+        self.last_action[user.id] = now
+        return await handler(event, data)
+
+# ════════════════════════════════════════
+# 3. ІНТЕЛЕКТУАЛЬНІ МОДУЛІ (OSINT + SYS)
+# ════════════════════════════════════════
+class IntelModule:
     @staticmethod
-    async def check_nickname(nickname: str) -> str:
-        """Перевірка нікнейма (стабільна версія)."""
+    async def get_osint_dossier(nickname: str) -> str:
         targets = {
             "GitHub": f"https://github.com/{nickname}",
             "Twitter": f"https://twitter.com/{nickname}",
             "Instagram": f"https://instagram.com/{nickname}",
             "Reddit": f"https://reddit.com/user/{nickname}",
-            "TikTok": f"https://tiktok.com/@{nickname}"
+            "Telegram": f"https://t.me/{nickname}"
         }
+        found = []
+        async with httpx.AsyncClient(timeout=7.0, follow_redirects=True) as client:
+            tasks = [client.get(url) for url in targets.values()]
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for (name, url), resp in zip(targets.items(), responses):
+                if not isinstance(resp, Exception) and resp.status_code == 200:
+                    found.append(f"✅ **{name}**: [Link]({url})")
         
-        results = []
-        # Використовуємо ліміт з'єднань, щоб не 'вішати' систему
-        limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
-        async with httpx.AsyncClient(timeout=10.0, limits=limits, follow_redirects=True) as client:
-            for site, url in targets.items():
-                try:
-                    resp = await client.get(url)
-                    if resp.status_code == 200:
-                        results.append(f"✅ **{site}**: [Посилання]({url})")
-                except Exception as e:
-                    logger.error(f"Помилка при перевірці {site}: {e}")
-                    continue
-        
-        if not results: return "🕵️ Жодних цифрових слідів не знайдено."
-        return "🔍 **РЕЗУЛЬТАТИ РОЗШУКУ:**\n\n" + "\n".join(results)
+        return "🔍 **OSINT ЗВІТ:**\n\n" + ("\n".join(found) if found else "Нічого не знайдено.")
 
     @staticmethod
-    async def ip_lookup(ip: str) -> str:
-        """Геолокація IP."""
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            try:
-                resp = await client.get(f"http://ip-api.com/json/{ip}")
-                data = resp.json()
-                if data.get('status') == 'fail': return "❌ Об'єкт не знайдено (невірний IP)."
-                return (
-                    f"🌍 **IP DOSSIER: {ip}**\n"
-                    f"📍 Локація: `{data.get('city')}, {data.get('country')}`\n"
-                    f"📡 Провайдер: `{data.get('isp')}`\n"
-                    f"🏢 Org: `{data.get('org')}`"
-                )
-            except Exception as e:
-                return f"❌ Помилка сервісу: {str(e)}"
+    def get_system_stats():
+        cpu = psutil.cpu_percent()
+        ram = psutil.virtual_memory().percent
+        try:
+            load = os.getloadavg()
+        except:
+            load = (0, 0, 0)
+        
+        uptime = str(timedelta(seconds=int(time.time() - psutil.boot_time())))
+        return (
+            f"📊 **СТАТУС СИСТЕМИ:**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🖥️ CPU: `{cpu}%` | RAM: `{ram}%`\n"
+            f"📈 Load: `{load[0]} {load[1]}`\n"
+            f"⏱️ Uptime: `{uptime}`\n"
+            f"🧬 Host: `{socket.gethostname()}`"
+        )
 
 # ════════════════════════════════════════
-# 3. ІНТЕРФЕЙС ТА ХЕНДЛЕРИ
+# 4. ГОЛОВНИЙ ІНТЕРФЕЙС
+# ════════════════════════════════════════
+def get_main_kb():
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="🕵️ Пробити людину", callback_data="ask_nick"))
+    b.row(InlineKeyboardButton(text="🌍 Пробити IP", callback_data="ask_ip"))
+    b.row(
+        InlineKeyboardButton(text="📊 Метрики", callback_data="stats"),
+        InlineKeyboardButton(text="🛡️ Безпека", callback_data="sec_check")
+    )
+    b.row(InlineKeyboardButton(text="📟 Terminal Mode", callback_data="term_help"))
+    b.row(InlineKeyboardButton(text="🔌 Вимкнути", callback_data="kill"))
+    return b.as_markup()
+
+# ════════════════════════════════════════
+# 5. ХЕНДЛЕРИ
 # ════════════════════════════════════════
 bot = Bot(token=Config.TOKEN)
 dp = Dispatcher()
-
-def main_kb():
-    b = InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(text="🕵️ Пробити нік", callback_data="osint_nick"))
-    b.row(InlineKeyboardButton(text="🌍 Пробити IP", callback_data="osint_ip"))
-    b.row(InlineKeyboardButton(text="📊 Статус сервера", callback_data="stats"))
-    b.row(InlineKeyboardButton(text="🔌 Off", callback_data="off"))
-    return b.as_markup()
+dp.message.middleware(SherlockGuard())
+dp.callback_query.middleware(SherlockGuard())
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    if message.from_user.id != Config.ADMIN_ID: return
-    await message.answer("🦾 **S47 SHERLOCK-REPAIR ACTIVATED.**\nСистему відновлено. Чекаю на вказівки.", reply_markup=main_kb())
+    await message.answer("🦾 **S47 SHERLOCK ULTIMATE v3.0**\nВсі модулі активовані. Railway Deploy Stable.", reply_markup=get_main_kb())
 
-@dp.callback_query(F.data == "osint_nick")
-async def cb_nick(cb: CallbackQuery):
-    await cb.message.answer("🕵️ Надішліть нікнейм з префіксом `?` (наприклад: `?ivan_crypto`)")
+@dp.callback_query(F.data == "ask_nick")
+async def cb_ask_nick(cb: CallbackQuery):
+    await cb.message.answer("🕵️ Введіть нікнейм для розшуку з префіксом `?` (напр: `?elonmusk`)")
     await cb.answer()
 
-@dp.callback_query(F.data == "osint_ip")
-async def cb_ip(cb: CallbackQuery):
-    await cb.message.answer("🌍 Надішліть IP з префіксом `!` (наприклад: `!1.1.1.1`)")
+@dp.callback_query(F.data == "ask_ip")
+async def cb_ask_ip(cb: CallbackQuery):
+    await cb.message.answer("🌍 Введіть IP для аналізу з префіксом `!` (напр: `!8.8.8.8`)")
     await cb.answer()
 
 @dp.message(F.text.startswith("?"))
-async def handle_nick(message: Message):
-    if message.from_user.id != Config.ADMIN_ID: return
+async def handle_osint(message: Message):
     nick = message.text[1:].strip()
     wait = await message.answer(f"🔎 Шерлок аналізує сліди `{nick}`...")
-    res = await OsintService.check_nickname(nick)
-    await wait.edit_text(res, parse_mode="Markdown", disable_web_page_preview=True)
+    report = await IntelModule.get_osint_dossier(nick)
+    await wait.edit_text(report, parse_mode="Markdown", disable_web_page_preview=True)
 
 @dp.message(F.text.startswith("!"))
 async def handle_ip(message: Message):
-    if message.from_user.id != Config.ADMIN_ID: return
     ip = message.text[1:].strip()
-    res = await OsintService.ip_lookup(ip)
-    await message.answer(res, parse_mode="Markdown")
+    async with httpx.AsyncClient() as client:
+        try:
+            r = await client.get(f"http://ip-api.com/json/{ip}")
+            d = r.json()
+            res = f"📍 **IP {ip}:** `{d.get('city')}, {d.get('country')}`\n📡 ISP: `{d.get('isp')}`"
+            await message.answer(res)
+        except:
+            await message.answer("❌ Помилка сервісу.")
 
 @dp.callback_query(F.data == "stats")
 async def cb_stats(cb: CallbackQuery):
-    cpu = psutil.cpu_percent()
-    ram = psutil.virtual_memory().percent
-    await cb.message.edit_text(f"📊 **SERVER STATUS:**\nCPU: `{cpu}%` | RAM: `{ram}%`", reply_markup=main_kb())
+    text = IntelModule.get_system_stats()
+    await cb.message.edit_text(text, reply_markup=get_main_kb(), parse_mode="Markdown")
 
-@dp.callback_query(F.data == "off")
-async def cb_off(cb: CallbackQuery):
-    await cb.message.edit_text("🔌 Offline.")
-    os._exit(0)
+@dp.callback_query(F.data == "term_help")
+async def cb_term(cb: CallbackQuery):
+    await cb.message.answer("📟 Напишіть команду через `$` (напр: `$ ls -la`)")
+    await cb.answer()
 
-# ════════════════════════════════════════
-# 4. STARTUP
-# ════════════════════════════════════════
-async def main():
-    logger.info("Bot is starting...")
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except Exception as e:
-        logger.critical(f"Fatal error: {e}")
+@dp.message(F.text.startswith("$"))
+async def handle_shell(message: Message):
+    cmd = message.text[1:].strip()
+    proc = await asyncio.create_subprocess_shell(
+        cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await proc.communicate()
+    res = (stdout + stderr).decode().strip() or "Виконано."
+    await message.answer(f"📝 **Вивід:**\n
