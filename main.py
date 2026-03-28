@@ -24,7 +24,7 @@ if not BOT_TOKEN or not ADMIN_ID or not GEMINI_KEY:
     logger.error("Перевірте змінні: BOT_TOKEN, ADMIN_ID, GEMINI_API_KEY")
     exit(1)
 
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_KEY}"
 
 # ════════════════════════════════════════
 # 2. СТАН КОРИСТУВАЧА
