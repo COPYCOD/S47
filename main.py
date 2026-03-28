@@ -16,15 +16,20 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("AI-BOT")
 
 load_dotenv()
-BOT_TOKEN   = os.getenv("BOT_TOKEN")
-ADMIN_ID    = int(os.getenv("ADMIN_ID", 0))
-GEMINI_KEY  = os.getenv("GEMINI_API_KEY")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID  = int(os.getenv("ADMIN_ID", 0))
+GROQ_KEY  = os.getenv("GROQ_API_KEY")
 
-if not BOT_TOKEN or not ADMIN_ID or not GEMINI_KEY:
-    logger.error("Перевірте змінні: BOT_TOKEN, ADMIN_ID, GEMINI_API_KEY")
+if not BOT_TOKEN or not ADMIN_ID or not GROQ_KEY:
+    logger.error("Перевірте змінні: BOT_TOKEN, ADMIN_ID, GROQ_API_KEY")
     exit(1)
 
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_KEY}"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_HEADERS = {
+    "Authorization": f"Bearer {GROQ_KEY}",
+    "Content-Type": "application/json"
+}
+MODEL = "llama-3.3-70b-versatile"  # найкраща безкоштовна модель Groq
 
 # ════════════════════════════════════════
 # 2. СТАН КОРИСТУВАЧА
@@ -42,9 +47,15 @@ def clear_history(uid: int):
 def add_to_history(uid: int, role: str, text: str):
     if uid not in user_history:
         user_history[uid] = []
-    user_history[uid].append({"role": role, "parts": [{"text": text}]})
+    user_history[uid].append({"role": role, "content": text})
     if len(user_history[uid]) > MAX_HISTORY:
         user_history[uid] = user_history[uid][-MAX_HISTORY:]
+
+SYSTEM_PROMPTS = {
+    "chat": "Ти корисний AI асистент. Відповідай українською мовою якщо не просять інакше. Будь лаконічним але повним.",
+    "translate": "Ти перекладач. Визнач мову тексту автоматично і перекладай на українську. Якщо текст вже українською — переклади на англійську. Відповідай ТІЛЬКИ перекладом, без пояснень.",
+    "summarize": "Ти експерт з аналізу тексту. Стисни наданий текст або переписку. Виділи: головну думку, ключові факти. Відповідай українською мовою, структуровано.",
+}
 
 # ════════════════════════════════════════
 # 3. MIDDLEWARE
@@ -57,59 +68,53 @@ class AuthMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 # ════════════════════════════════════════
-# 4. GEMINI API
+# 4. GROQ API
 # ════════════════════════════════════════
-SYSTEM_PROMPTS = {
-    "chat": "Ти корисний AI асистент. Відповідай українською мовою якщо не просять інакше. Будь лаконічним але повним.",
-    "translate": "Ти перекладач. Визнач мову тексту автоматично і перекладай на українську. Якщо текст вже українською — переклади на англійську. Відповідай ТІЛЬКИ перекладом, без пояснень.",
-    "summarize": "Ти експерт з аналізу тексту. Стисни наданий текст або переписку. Виділи: головну думку, ключові факти. Відповідай українською мовою, структуровано.",
-}
-
-async def ask_gemini(uid: int, text: str) -> str:
+async def ask_groq(uid: int, text: str) -> str:
     mode = get_mode(uid)
-    system = SYSTEM_PROMPTS[mode]
-
     add_to_history(uid, "user", text)
 
-    body = {
-        "system_instruction": {"parts": [{"text": system}]},
-        "contents": user_history[uid]
-    }
+    messages = [{"role": "system", "content": SYSTEM_PROMPTS[mode]}] + user_history[uid]
+
+    body = {"model": MODEL, "messages": messages, "max_tokens": 1024}
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(GEMINI_URL, json=body) as r:
+            async with session.post(GROQ_URL, headers=GROQ_HEADERS, json=body) as r:
                 data = await r.json()
                 if r.status != 200:
-                    return f"⚠️ Помилка API: {data.get('error', {}).get('message', str(data))}"
-                reply = data["candidates"][0]["content"]["parts"][0]["text"]
-                add_to_history(uid, "model", reply)
+                    return f"⚠️ Помилка API: {data.get('error', {}).get('message', str(data))[:150]}"
+                reply = data["choices"][0]["message"]["content"]
+                add_to_history(uid, "assistant", reply)
                 return reply
     except Exception as e:
-        logger.error(f"Gemini error: {e}")
+        logger.error(f"Groq error: {e}")
         return f"⚠️ Помилка з'єднання: {str(e)[:100]}"
 
-async def analyze_photo_gemini(image_data: bytes, caption: str = "") -> str:
+async def analyze_photo_groq(image_data: bytes, caption: str = "") -> str:
+    """Аналіз фото через Groq (llama-3.2-11b-vision-preview підтримує зображення)"""
     prompt = caption if caption else "Детально опиши що зображено на цьому фото. Якщо є текст — прочитай його."
     b64 = base64.b64encode(image_data).decode("utf-8")
 
     body = {
-        "contents": [{
-            "parts": [
-                {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
-                {"text": prompt}
+        "model": "llama-3.2-11b-vision-preview",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                {"type": "text", "text": f"{prompt} Відповідай українською мовою."}
             ]
         }],
-        "system_instruction": {"parts": [{"text": "Відповідай українською мовою."}]}
+        "max_tokens": 1024
     }
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(GEMINI_URL, json=body) as r:
+            async with session.post(GROQ_URL, headers=GROQ_HEADERS, json=body) as r:
                 data = await r.json()
                 if r.status != 200:
-                    return f"⚠️ Помилка: {data.get('error', {}).get('message', str(data))}"
-                return data["candidates"][0]["content"]["parts"][0]["text"]
+                    return f"⚠️ Помилка: {data.get('error', {}).get('message', str(data))[:150]}"
+                return data["choices"][0]["message"]["content"]
     except Exception as e:
         return f"⚠️ Помилка аналізу: {str(e)[:100]}"
 
@@ -187,7 +192,7 @@ async def handle_photo(message: Message):
         file = await bot.get_file(photo.file_id)
         file_bytes = await bot.download_file(file.file_path)
         image_data = file_bytes.read()
-        result = await analyze_photo_gemini(image_data, message.caption or "")
+        result = await analyze_photo_groq(image_data, message.caption or "")
         await thinking.edit_text(f"🖼 **Аналіз фото:**\n\n{result}", parse_mode="Markdown")
     except Exception as e:
         await thinking.edit_text(f"⚠️ Помилка: {e}")
@@ -197,7 +202,7 @@ async def handle_text(message: Message):
     uid = message.from_user.id
     icons = {"chat": "💬", "translate": "🌐", "summarize": "📝"}
     thinking = await message.answer(f"{icons[get_mode(uid)]} Обробляю...")
-    reply = await ask_gemini(uid, message.text)
+    reply = await ask_groq(uid, message.text)
     try:
         await thinking.edit_text(reply)
     except Exception:
@@ -208,7 +213,7 @@ async def handle_text(message: Message):
 # 7. MAIN
 # ════════════════════════════════════════
 async def main():
-    logger.info("AI Бот на Gemini запущено.")
+    logger.info("AI Бот на Groq запущено.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
@@ -216,3 +221,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Бот зупинено.")
+        
