@@ -1,417 +1,154 @@
-import os
+    import os
 import asyncio
 import logging
 import psutil
 import time
-from datetime import datetime, timedelta
+import httpx
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
+from typing import Dict, List
 from dotenv import load_dotenv
-from typing import Dict
 
-# ════════════════════════════════════════
-# ВИПРАВЛЕНО: BaseMiddleware тепер імпортований
-# ════════════════════════════════════════
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.filters import Command
 from aiogram.types import (
-    Message, CallbackQuery,
-    InlineKeyboardButton
+    Message, CallbackQuery, 
+    InlineKeyboardButton, InlineKeyboardMarkup
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ════════════════════════════════════════
-# 1. ЛОГУВАННЯ + КОНФІГУРАЦІЯ
+# 1. CONFIG & LOGGING
 # ════════════════════════════════════════
-LOG_FILE = "s47_overlord.log"
-log_handler = RotatingFileHandler(
-    LOG_FILE, maxBytes=10 * 1024 * 1024,
-    backupCount=5, encoding="utf-8"
-)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[log_handler, logging.StreamHandler()]
-)
-logger = logging.getLogger("S47-OVERLORD")
+LOG_FILE = "sherlock_osint.log"
+handler = RotatingFileHandler(LOG_FILE, maxBytes=20*1024*1024, backupCount=5, encoding='utf-8')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s]: %(message)s', handlers=[handler])
+logger = logging.getLogger("SHERLOCK-OSINT")
 
 load_dotenv()
-
 class Config:
-    TOKEN       = os.getenv("BOT_TOKEN")
-    ADMIN_ID    = int(os.getenv("ADMIN_ID", 0))
-    CPU_LIMIT   = int(os.getenv("CPU_THRESHOLD",  90))
-    RAM_LIMIT   = int(os.getenv("RAM_THRESHOLD",  85))
-    DISK_LIMIT  = int(os.getenv("DISK_THRESHOLD", 95))
-    # ВИПРАВЛЕНО: NET_INTERFACE тепер читається з .env (як на скріні)
-    NET_IFACE   = os.getenv("NET_INTERFACE", "eth0")
-    THROTTLE_S  = float(os.getenv("THROTTLE_SEC", 0.8))
-    ALERT_CD_S  = int(os.getenv("ALERT_COOLDOWN_SEC", 900))  # 15 хвилин
+    TOKEN = os.getenv("BOT_TOKEN")
+    ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+    # Порожній ключ для Google Search (якщо захочете додати пізніше)
+    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 
 if not Config.TOKEN or not Config.ADMIN_ID:
-    logger.critical("Відсутні BOT_TOKEN або ADMIN_ID у .env!")
-    exit(1)
+    exit("CRITICAL: Config missing!")
 
 # ════════════════════════════════════════
-# 2. MIDDLEWARE — ВИПРАВЛЕНО ВСІ БАГИ
+# 2. OSINT LOGIC MODULE
 # ════════════════════════════════════════
-class SentinelAuthMiddleware(BaseMiddleware):
-    """
-    ВИПРАВЛЕНО:
-    - user_id замість user.id (NameError у оригіналі)
-    - Єдиний middleware для messages і callbacks
-    """
-    def __init__(self):
-        self._cache: Dict[int, float] = {}
-        super().__init__()
-
-    async def __call__(self, handler, event, data):
-        # Отримуємо user як з Message так і з CallbackQuery
-        user = getattr(event, "from_user", None)
-        if user is None or user.id != Config.ADMIN_ID:
-            if user:
-                logger.warning(
-                    f"Несанкціонований доступ: id={user.id} @{user.username}"
-                )
-            return
-
-        now = time.monotonic()  # ПОКРАЩЕНО: monotonic стабільніший за time()
-        uid = user.id
-        if uid in self._cache and now - self._cache[uid] < Config.THROTTLE_S:
-            if isinstance(event, CallbackQuery):
-                await event.answer("⏳ Зачекайте секунду...", show_alert=False)
-            return
-
-        self._cache[uid] = now
-        asyncio.create_task(self._evict(uid, now))
-        return await handler(event, data)
-
-    async def _evict(self, uid: int, ts: float):
-        await asyncio.sleep(Config.THROTTLE_S + 1)
-        if self._cache.get(uid) == ts:
-            self._cache.pop(uid, None)
-
-# ════════════════════════════════════════
-# 3. SYSTEM SERVICE
-# ════════════════════════════════════════
-class SystemService:
-
+class OsintService:
     @staticmethod
-    def fmt(n: float) -> str:
-        for u in ("B", "KB", "MB", "GB", "TB"):
-            if n < 1024:
-                return f"{n:.2f} {u}"
-            n /= 1024
-        return f"{n:.2f} PB"
-
-    @staticmethod
-    def uptime() -> str:
-        s = int(time.time() - psutil.boot_time())
-        d, r = divmod(s, 86400)
-        h, r = divmod(r, 3600)
-        m    = r // 60
-        return f"{d}д {h}г {m}хв"
-
-    @classmethod
-    async def full_report(cls) -> str:
-        cpu  = await asyncio.to_thread(psutil.cpu_percent, 1)
-        ram  = psutil.virtual_memory()
-        disk = psutil.disk_usage("/")
-        net  = psutil.net_io_counters()
-        load = psutil.getloadavg()          # НОВЕ: load average (1/5/15 хв)
-        temp = cls._cpu_temp()              # НОВЕ: температура (якщо доступна)
-
-        return (
-            f"🚀 **S47 OVERLORD — ПОВНИЙ ЗВІТ**\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🖥  CPU:   `{cpu}%` (ліміт {Config.CPU_LIMIT}%){temp}\n"
-            f"🧠  RAM:   `{ram.percent}%` — вільно `{cls.fmt(ram.available)}`\n"
-            f"💾  Disk:  `{disk.percent}%` — вільно `{cls.fmt(disk.free)}`\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊  Load:  `{load[0]:.2f}` / `{load[1]:.2f}` / `{load[2]:.2f}`\n"
-            f"📡  Net ↓  `{cls.fmt(net.bytes_recv)}`  ↑ `{cls.fmt(net.bytes_sent)}`\n"
-            f"📦  Pkt ↓  `{net.packets_recv}`   ↑ `{net.packets_sent}`\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⏱  Uptime: `{cls.uptime()}`\n"
-            f"📅  Час:   `{datetime.now().strftime('%d.%m.%Y %H:%M:%S')}`"
-        )
-
-    @staticmethod
-    def _cpu_temp() -> str:
-        """НОВЕ: температура CPU якщо psutil підтримує на цій ОС."""
-        try:
-            temps = psutil.sensors_temperatures()
-            if not temps:
-                return ""
-            for key in ("coretemp", "cpu_thermal", "k10temp"):
-                if key in temps:
-                    t = temps[key][0].current
-                    return f"  🌡 `{t:.0f}°C`"
-        except (AttributeError, Exception):
-            pass
-        return ""
-
-    @classmethod
-    async def net_report(cls) -> str:
-        """ВИПРАВЛЕНО: net_info callback тепер має повний хендлер."""
-        net   = psutil.net_io_counters()
-        iface = Config.NET_IFACE
-
-        # Статистика конкретного інтерфейсу
-        per = psutil.net_io_counters(pernic=True)
-        iface_line = ""
-        if iface in per:
-            i = per[iface]
-            iface_line = (
-                f"\n📌 **{iface}:**\n"
-                f"   ↓ `{cls.fmt(i.bytes_recv)}`  ↑ `{cls.fmt(i.bytes_sent)}`"
-            )
-
-        # З'єднання (потребує root на деяких ОС)
-        try:
-            conns = len(psutil.net_connections())
-            conn_line = f"`{conns}` активних з'єднань"
-        except psutil.AccessDenied:
-            conn_line = "🚫 root потрібен для з'єднань"
-
-        # Активні інтерфейси
-        up = [n for n, s in psutil.net_if_stats().items() if s.isup]
-
-        return (
-            f"🌐 **МЕРЕЖЕВА СТАТИСТИКА**\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📥 Всього отримано:  `{cls.fmt(net.bytes_recv)}`\n"
-            f"📤 Всього відправлено: `{cls.fmt(net.bytes_sent)}`\n"
-            f"📦 Пакети ↓/↑: `{net.packets_recv}` / `{net.packets_sent}`\n"
-            f"❌ Помилки ↓/↑: `{net.errin}` / `{net.errout}`\n"
-            f"🗑 Dropped ↓/↑: `{net.dropin}` / `{net.dropout}`\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🟢 Активні: `{', '.join(up)}`\n"
-            f"🔌 З'єднань: {conn_line}"
-            f"{iface_line}"
-        )
-
-    @staticmethod
-    async def top_processes(n: int = 10) -> str:
-        """ПОКРАЩЕНО: винесено в asyncio.to_thread, не блокує event loop."""
-        def _collect():
-            procs = []
-            for p in psutil.process_iter(["name", "cpu_percent", "memory_percent", "pid"]):
+    async def check_nickname(nickname: str) -> str:
+        """Перевірка нікнейма на популярних ресурсах."""
+        targets = {
+            "GitHub": f"https://github.com/{nickname}",
+            "Twitter": f"https://twitter.com/{nickname}",
+            "Instagram": f"https://instagram.com/{nickname}",
+            "Reddit": f"https://reddit.com/user/{nickname}",
+            "TikTok": f"https://tiktok.com/@{nickname}",
+            "Pinterest": f"https://pinterest.com/{nickname}"
+        }
+        
+        results = []
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            for site, url in targets.items():
                 try:
-                    if (p.info["cpu_percent"] or 0) > 0:
-                        procs.append(p.info)
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-            return sorted(procs, key=lambda x: x["cpu_percent"] or 0, reverse=True)[:n]
+                    resp = await client.get(url)
+                    if resp.status_code == 200:
+                        results.append(f"✅ **{site}**: {url}")
+                except:
+                    continue
+        
+        if not results: return "🕵️ Жодних збігів за цим нікнеймом не знайдено."
+        return "🔍 **ЗНАЙДЕНІ ПРОФІЛІ:**\n\n" + "\n".join(results)
 
-        top = await asyncio.to_thread(_collect)
-        lines = ["⚙️ **ТОП ПРОЦЕСІВ (CPU)**\n━━━━━━━━━━━━━━━━━━━━"]
-        for p in top:
-            lines.append(
-                f"`{str(p['pid']):<6}` "
-                f"`{p['name'][:14]:<14}` "
-                f"C:`{p['cpu_percent']:>5.1f}%` "
-                f"R:`{p['memory_percent']:>4.1f}%`"
-            )
-        return "\n".join(lines) if len(lines) > 1 else "❌ Активних процесів не знайдено."
+    @staticmethod
+    async def ip_lookup(ip: str) -> str:
+        """Геолокація та дані про IP."""
+        async with httpx.AsyncClient() as client:
+            try:
+                resp = await client.get(f"http://ip-api.com/json/{ip}?fields=status,message,country,city,isp,org,as,query")
+                data = resp.json()
+                if data['status'] == 'fail': return "❌ Помилка: Невірний IP."
+                return (
+                    f"🌍 **IP DOSSIER: {ip}**\n"
+                    f"📍 Місто: `{data.get('city')}, {data.get('country')}`\n"
+                    f"📡 Провайдер: `{data.get('isp')}`\n"
+                    f"🏢 Організація: `{data.get('org')}`"
+                )
+            except:
+                return "❌ Сервіс перевірки IP недоступний."
 
 # ════════════════════════════════════════
-# 4. КЛАВІАТУРИ
+# 3. INTERFACE
 # ════════════════════════════════════════
-def main_kb() -> InlineKeyboardBuilder:
+def main_kb():
     b = InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(text="📊 Статистика",   callback_data="stats"))
+    b.row(InlineKeyboardButton(text="🕵️ OSINT: Пробити нік", callback_data="osint_nick"))
+    b.row(InlineKeyboardButton(text="🌍 OSINT: Пробити IP", callback_data="osint_ip"))
     b.row(
-        InlineKeyboardButton(text="⚙️ Процеси",  callback_data="procs"),
-        InlineKeyboardButton(text="🌐 Мережа",   callback_data="net"),
+        InlineKeyboardButton(text="📊 Сервер", callback_data="stats"),
+        InlineKeyboardButton(text="📟 Shell", callback_data="shell")
     )
-    b.row(
-        InlineKeyboardButton(text="📋 Логи",     callback_data="logs"),
-        InlineKeyboardButton(text="❤️ Health",   callback_data="health"),
-    )
-    b.row(InlineKeyboardButton(text="🔌 Shutdown", callback_data="shutdown_confirm"))
-    return b
-
-def back_kb() -> InlineKeyboardBuilder:
-    b = InlineKeyboardBuilder()
-    b.add(InlineKeyboardButton(text="⬅️ Меню", callback_data="menu"))
-    return b
+    b.row(InlineKeyboardButton(text="🔌 Off", callback_data="off"))
+    return b.as_markup()
 
 # ════════════════════════════════════════
-# 5. БОТ + ХЕНДЛЕРИ
+# 4. HANDLERS
 # ════════════════════════════════════════
 bot = Bot(token=Config.TOKEN)
-dp  = Dispatcher()
+dp = Dispatcher()
 
-# ВИПРАВЛЕНО: middleware застосований і до messages, і до callbacks
-auth = SentinelAuthMiddleware()
-dp.message.middleware(auth)
-dp.callback_query.middleware(auth)
+# Захист (Тільки Командир)
+@dp.message(F.from_user.id != Config.ADMIN_ID)
+async def access_denied(message: Message):
+    logger.warning(f"Access Denied for {message.from_user.id}")
+    return
 
-# ── /start ──────────────────────────────
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    await message.answer(
-        "🦾 **S47 OVERLORD ACTIVATED.**\n"
-        "Пане Командире, система під повним контролем.",
-        reply_markup=main_kb().as_markup(),
-        parse_mode="Markdown"
-    )
+    await message.answer("🦾 **S47 SHERLOCK-OSINT ACTIVATED.**\nВведіть об'єкт для аналізу.", reply_markup=main_kb())
 
-# ── Головне меню (кнопка «назад») ───────
-@dp.callback_query(F.data == "menu")
-async def cb_menu(cb: CallbackQuery):
-    await cb.message.edit_text(
-        "🦾 **S47 OVERLORD** — Головне меню",
-        reply_markup=main_kb().as_markup(),
-        parse_mode="Markdown"
-    )
+@dp.callback_query(F.data == "osint_nick")
+async def cb_nick(cb: CallbackQuery):
+    await cb.message.answer("🕵️ **Введіть нікнейм для пошуку (без @):**\nПриклад: `john_doe` або просто напишіть `?нік` (напр. `?sherlock`)")
+    await cb.answer()
 
-# ── Статистика ───────────────────────────
+@dp.callback_query(F.data == "osint_ip")
+async def cb_ip(cb: CallbackQuery):
+    await cb.message.answer("🌍 **Введіть IP-адресу для аналізу:**\nПриклад: `!8.8.8.8` (використовуйте знак оклику на початку)")
+    await cb.answer()
+
+# Обробка пробиття нікнейма через ?
+@dp.message(F.text.startswith("?"))
+async def search_nick(message: Message):
+    nick = message.text[1:].strip()
+    wait = await message.answer(f"🔎 Шерлок шукає сліди `{nick}` у мережі...")
+    res = await OsintService.check_nickname(nick)
+    await wait.edit_text(res, parse_mode="Markdown", disable_web_page_preview=True)
+
+# Обробка пробиття IP через !
+@dp.message(F.text.startswith("!"))
+async def search_ip(message: Message):
+    ip = message.text[1:].strip()
+    res = await OsintService.ip_lookup(ip)
+    await message.answer(res, parse_mode="Markdown")
+
 @dp.callback_query(F.data == "stats")
 async def cb_stats(cb: CallbackQuery):
-    await cb.answer()
-    report = await SystemService.full_report()
-    try:
-        await cb.message.edit_text(
-            report,
-            parse_mode="Markdown",
-            reply_markup=back_kb().as_markup()
-        )
-    except Exception:
-        await cb.answer("Дані не змінились", show_alert=False)
+    cpu = psutil.cpu_percent()
+    ram = psutil.virtual_memory().percent
+    await cb.message.edit_text(f"📊 **SERVER:** CPU `{cpu}%` | RAM `{ram}%`", reply_markup=main_kb())
 
-# ── Процеси ──────────────────────────────
-@dp.callback_query(F.data == "procs")
-async def cb_procs(cb: CallbackQuery):
-    await cb.answer()
-    text = await SystemService.top_processes()
-    await cb.message.edit_text(
-        text, parse_mode="Markdown",
-        reply_markup=back_kb().as_markup()
-    )
-
-# ── Мережа (ВИПРАВЛЕНО: був відсутній хендлер) ──
-@dp.callback_query(F.data == "net")
-async def cb_net(cb: CallbackQuery):
-    await cb.answer()
-    report = await SystemService.net_report()
-    await cb.message.edit_text(
-        report, parse_mode="Markdown",
-        reply_markup=back_kb().as_markup()
-    )
-
-# ── Логи ─────────────────────────────────
-@dp.callback_query(F.data == "logs")
-async def cb_logs(cb: CallbackQuery):
-    await cb.answer()
-    if not os.path.exists(LOG_FILE):
-        return await cb.answer("Файл логів порожній", show_alert=True)
-    try:
-        with open(LOG_FILE, "rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            f.seek(max(0, size - 3000))
-            text = f.read().decode("utf-8", errors="ignore")
-        await cb.message.edit_text(
-            f"📋 **ОСТАННІ ПОДІЇ:**\n```\n{text}\n```",
-            parse_mode="Markdown",
-            reply_markup=back_kb().as_markup()
-        )
-    except Exception as e:
-        await cb.answer(f"Помилка: {e}", show_alert=True)
-
-# ── Health ───────────────────────────────
-@dp.callback_query(F.data == "health")
-async def cb_health(cb: CallbackQuery):
-    await cb.answer()
-    cpu  = psutil.cpu_percent(interval=None)
-    ram  = psutil.virtual_memory().percent
-    disk = psutil.disk_usage("/").percent
-
-    ok = cpu < Config.CPU_LIMIT and ram < Config.RAM_LIMIT and disk < Config.DISK_LIMIT
-    icon = "🟢 OK" if ok else "🔴 УВАГА"
-
-    await cb.message.edit_text(
-        f"❤️ **HEALTHCHECK — {icon}**\n"
-        f"CPU `{cpu}%` | RAM `{ram}%` | Disk `{disk}%`\n"
-        f"Uptime: `{SystemService.uptime()}`",
-        parse_mode="Markdown",
-        reply_markup=back_kb().as_markup()
-    )
-
-# ── Shutdown ─────────────────────────────
-@dp.callback_query(F.data == "shutdown_confirm")
-async def cb_shutdown_confirm(cb: CallbackQuery):
-    kb = InlineKeyboardBuilder()
-    kb.add(InlineKeyboardButton(text="✅ ТАК, вимкнути", callback_data="shutdown_exec"))
-    kb.add(InlineKeyboardButton(text="❌ Скасувати",     callback_data="menu"))
-    await cb.message.edit_text(
-        "⚠️ **Вимкнути S47 Overlord?**\nМоніторинг зупиниться повністю.",
-        reply_markup=kb.as_markup(),
-        parse_mode="Markdown"
-    )
-
-@dp.callback_query(F.data == "shutdown_exec")
-async def cb_shutdown_exec(cb: CallbackQuery):
-    await cb.message.edit_text("🔌 **S47 OVERLORD OFFLINE.** Честь маю, Командире.")
-    await bot.session.close()
+@dp.callback_query(F.data == "off")
+async def cb_off(cb: CallbackQuery):
+    await cb.message.edit_text("🔌 Offline.")
     os._exit(0)
 
-# ════════════════════════════════════════
-# 6. ФОНОВИЙ МОНІТОРИНГ
-#    ВИПРАВЛЕНО: Disk alert тепер є (був у .env але відсутній у коді)
-# ════════════════════════════════════════
-async def alert_monitor():
-    logger.info("Фоновий моніторинг S47-OVERLORD запущено.")
-    psutil.cpu_percent(interval=None)  # прогрів
-    cooldowns: Dict[str, float] = {}
-
-    def can_alert(key: str) -> bool:
-        now = time.monotonic()
-        if now - cooldowns.get(key, 0) > Config.ALERT_CD_S:
-            cooldowns[key] = now
-            return True
-        return False
-
-    while True:
-        try:
-            cpu  = await asyncio.to_thread(psutil.cpu_percent, 0.5)
-            ram  = psutil.virtual_memory().percent
-            disk = psutil.disk_usage("/").percent
-
-            checks = [
-                ("cpu",  cpu,  Config.CPU_LIMIT,  f"🚨 **CPU CRITICAL:** `{cpu}%`!"),
-                ("ram",  ram,  Config.RAM_LIMIT,  f"🚨 **RAM CRITICAL:** `{ram}%`! Можливий OOM!"),
-                # ВИПРАВЛЕНО: disk тепер теж алертить
-                ("disk", disk, Config.DISK_LIMIT, f"🚨 **DISK CRITICAL:** `{disk}%`! Місце закінчується!"),
-            ]
-
-            for key, val, limit, msg in checks:
-                if val > limit and can_alert(key):
-                    await bot.send_message(Config.ADMIN_ID, msg, parse_mode="Markdown")
-                    logger.warning(f"ALERT відправлено: {key}={val}%")
-
-        except Exception as e:
-            logger.error(f"Monitor error: {e}")
-            await asyncio.sleep(10)
-
-        await asyncio.sleep(30)
-
-# ════════════════════════════════════════
-# 7. MAIN
-# ════════════════════════════════════════
 async def main():
-    monitor = asyncio.create_task(alert_monitor())
-    logger.info("S47 Overlord запущено та готовий.")
-    try:
-        await dp.start_polling(bot)
-    finally:
-        monitor.cancel()
-        await bot.session.close()
-        logger.info("S47 Overlord зупинено.")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Вихід.")
+    asyncio.run(main())
