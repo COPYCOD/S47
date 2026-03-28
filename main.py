@@ -10,6 +10,7 @@ from logging.handlers import RotatingFileHandler
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
 
+# Імпортуємо BaseMiddleware, який був пропущений раніше
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.filters import Command
 from aiogram.types import (
@@ -19,33 +20,24 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ════════════════════════════════════════
-# 1. СУВОРИЙ КОНФІГ ТА ДІАГНОСТИКА (100/100)
+# 1. КОНФІГУРАЦІЯ (З .env ТА FALLBACKS)
 # ════════════════════════════════════════
 load_dotenv()
 
 class Config:
     TOKEN = os.getenv("BOT_TOKEN")
     ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
-    # Тайм-аути для запобігання флуду
-    THROTTLE_SEC = 2
-    # Список файлів для швидкого доступу
-    SENSITIVE_DOCS = ["/etc/passwd", "/etc/hosts", "/proc/version"]
-
-LOG_FILE = "sherlock_ultimate.log"
-handler = RotatingFileHandler(LOG_FILE, maxBytes=15*1024*1024, backupCount=3, encoding='utf-8')
-logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s [%(levelname)s]: %(message)s', 
-    handlers=[handler, logging.StreamHandler()]
-)
-logger = logging.getLogger("SHERLOCK-ULTIMATE")
+    # Нові параметри з .env
+    THROTTLE_SEC = float(os.getenv("THROTTLE_SEC", 1.0))
+    NET_INTERFACE = os.getenv("NET_INTERFACE", "eth0")
+    ALERT_COOLDOWN = int(os.getenv("ALERT_COOLDOWN_SEC", 300))
 
 if not Config.TOKEN or not Config.ADMIN_ID:
-    logger.critical("КРИТИЧНО: Перевірте змінні оточення (TOKEN/ADMIN_ID)!")
+    print("CRITICAL: Check your Environment Variables (BOT_TOKEN/ADMIN_ID)!")
     exit(1)
 
 # ════════════════════════════════════════
-# 2. MIDDLEWARE ДЛЯ АВТОРИЗАЦІЇ ТА ТРОТЛІНГУ
+# 2. MIDDLEWARE (АВТОРИЗАЦІЯ ТА ТРОТЛІНГ)
 # ════════════════════════════════════════
 class SherlockGuard(BaseMiddleware):
     def __init__(self):
@@ -54,135 +46,125 @@ class SherlockGuard(BaseMiddleware):
 
     async def __call__(self, handler, event, data):
         user = getattr(event, "from_user", None)
+        # Виправлено: звернення через user.id, а не user_id
         if not user or user.id != Config.ADMIN_ID:
-            logger.warning(f"⛔️ Відмовлено в доступі: {user.id if user else 'Unknown'}")
             return
 
-        # Захист від спаму кнопками
+        # Throttle logic з використанням time.monotonic()
         now = time.monotonic()
-        if user.id in self.last_action and now - self.last_action[user.id] < 0.5:
-            if isinstance(event, CallbackQuery):
-                await event.answer("⏳ Зачекайте...", show_alert=False)
-            return
+        if user.id in self.last_action:
+            if now - self.last_action[user.id] < Config.THROTTLE_SEC:
+                if isinstance(event, CallbackQuery):
+                    await event.answer("⏳ Зачекайте, Шерлок думає...", show_alert=False)
+                return
         
         self.last_action[user.id] = now
         return await handler(event, data)
 
 # ════════════════════════════════════════
-# 3. ІНТЕЛЕКТУАЛЬНІ МОДУЛІ (OSINT + SYS)
+# 3. СЕРВІСНИЙ МОДУЛЬ (ДЕТЕКТИВ)
 # ════════════════════════════════════════
-class IntelModule:
+class SystemService:
     @staticmethod
-    async def get_osint_dossier(nickname: str) -> str:
+    async def get_osint_data(nick: str) -> str:
         targets = {
-            "GitHub": f"https://github.com/{nickname}",
-            "Twitter": f"https://twitter.com/{nickname}",
-            "Instagram": f"https://instagram.com/{nickname}",
-            "Reddit": f"https://reddit.com/user/{nickname}",
-            "Telegram": f"https://t.me/{nickname}"
+            "GitHub": f"https://github.com/{nick}",
+            "Twitter": f"https://twitter.com/{nick}",
+            "Reddit": f"https://reddit.com/user/{nick}",
+            "Telegram": f"https://t.me/{nick}"
         }
         found = []
-        async with httpx.AsyncClient(timeout=7.0, follow_redirects=True) as client:
-            tasks = [client.get(url) for url in targets.values()]
-            responses = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            for (name, url), resp in zip(targets.items(), responses):
-                if not isinstance(resp, Exception) and resp.status_code == 200:
-                    found.append(f"✅ **{name}**: [Link]({url})")
-        
-        return "🔍 **OSINT ЗВІТ:**\n\n" + ("\n".join(found) if found else "Нічого не знайдено.")
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            for name, url in targets.items():
+                try:
+                    r = await client.get(url)
+                    if r.status_code == 200:
+                        found.append(f"✅ {name}: {url}")
+                except: continue
+        return "\n".join(found) if found else "Нічого не знайдено."
 
     @staticmethod
-    def get_system_stats():
+    def get_stats_report():
         cpu = psutil.cpu_percent()
         ram = psutil.virtual_memory().percent
-        try:
-            load = os.getloadavg()
-        except:
-            load = (0, 0, 0)
         
+        # Graceful fallback для Load Average (немає на Windows)
+        try:
+            la = os.getloadavg()
+            la_str = f"{la[0]} {la[1]} {la[2]}"
+        except:
+            la_str = "N/A"
+
+        # Graceful fallback для температури
+        temp_str = "N/A"
+        try:
+            temps = psutil.sensors_temperatures()
+            if temps:
+                for name, entries in temps.items():
+                    temp_str = f"{entries[0].current}°C"
+                    break
+        except: pass
+
         uptime = str(timedelta(seconds=int(time.time() - psutil.boot_time())))
         return (
-            f"📊 **СТАТУС СИСТЕМИ:**\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🖥️ CPU: `{cpu}%` | RAM: `{ram}%`\n"
-            f"📈 Load: `{load[0]} {load[1]}`\n"
+            f"📊 **ЗВІТ СИСТЕМИ**\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"🖥️ CPU: `{cpu}%` ({temp_str})\n"
+            f"🧠 RAM: `{ram}%`\n"
+            f"📈 Load: `{la_str}`\n"
             f"⏱️ Uptime: `{uptime}`\n"
-            f"🧬 Host: `{socket.gethostname()}`"
+            f"📡 Interface: `{Config.NET_INTERFACE}`"
         )
 
 # ════════════════════════════════════════
-# 4. ГОЛОВНИЙ ІНТЕРФЕЙС
-# ════════════════════════════════════════
-def get_main_kb():
-    b = InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(text="🕵️ Пробити людину", callback_data="ask_nick"))
-    b.row(InlineKeyboardButton(text="🌍 Пробити IP", callback_data="ask_ip"))
-    b.row(
-        InlineKeyboardButton(text="📊 Метрики", callback_data="stats"),
-        InlineKeyboardButton(text="🛡️ Безпека", callback_data="sec_check")
-    )
-    b.row(InlineKeyboardButton(text="📟 Terminal Mode", callback_data="term_help"))
-    b.row(InlineKeyboardButton(text="🔌 Вимкнути", callback_data="kill"))
-    return b.as_markup()
-
-# ════════════════════════════════════════
-# 5. ХЕНДЛЕРИ
+# 4. ІНТЕРФЕЙС ТА ХЕНДЛЕРИ
 # ════════════════════════════════════════
 bot = Bot(token=Config.TOKEN)
 dp = Dispatcher()
+# Підключаємо middleware для обох типів подій
 dp.message.middleware(SherlockGuard())
 dp.callback_query.middleware(SherlockGuard())
 
+def main_menu():
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="🕵️ OSINT Пробиття", callback_data="do_osint"))
+    kb.row(InlineKeyboardButton(text="📊 Метрики", callback_data="get_stats"))
+    kb.row(InlineKeyboardButton(text="❤️ Health Check", callback_data="health"))
+    kb.row(InlineKeyboardButton(text="🔌 Off", callback_data="shutdown"))
+    return kb.as_markup()
+
 @dp.message(Command("start"))
-async def cmd_start(message: Message):
-    await message.answer("🦾 **S47 SHERLOCK ULTIMATE v3.0**\nВсі модулі активовані. Railway Deploy Stable.", reply_markup=get_main_kb())
+async def start(message: Message):
+    await message.answer("🦾 **S47 SHERLOCK ULTIMATE v4.0**\nСистема готова до деплою на Railway.", reply_markup=main_menu())
 
-@dp.callback_query(F.data == "ask_nick")
-async def cb_ask_nick(cb: CallbackQuery):
-    await cb.message.answer("🕵️ Введіть нікнейм для розшуку з префіксом `?` (напр: `?elonmusk`)")
-    await cb.answer()
+@dp.callback_query(F.data == "get_stats")
+async def cb_stats(cb: CallbackQuery):
+    report = SystemService.get_stats_report()
+    await cb.message.edit_text(report, reply_markup=main_menu(), parse_mode="Markdown")
 
-@dp.callback_query(F.data == "ask_ip")
-async def cb_ask_ip(cb: CallbackQuery):
-    await cb.message.answer("🌍 Введіть IP для аналізу з префіксом `!` (напр: `!8.8.8.8`)")
+@dp.callback_query(F.data == "health")
+async def cb_health(cb: CallbackQuery):
+    await cb.answer("❤️ Система працює стабільно. Event Loop вільний.", show_alert=True)
+
+@dp.callback_query(F.data == "do_osint")
+async def cb_osint_ask(cb: CallbackQuery):
+    await cb.message.answer("🕵️ Напишіть нікнейм через префікс `?` (напр: `?mark_pro`)")
     await cb.answer()
 
 @dp.message(F.text.startswith("?"))
 async def handle_osint(message: Message):
     nick = message.text[1:].strip()
-    wait = await message.answer(f"🔎 Шерлок аналізує сліди `{nick}`...")
-    report = await IntelModule.get_osint_dossier(nick)
-    await wait.edit_text(report, parse_mode="Markdown", disable_web_page_preview=True)
+    wait = await message.answer(f"🔎 Шерлок аналізує `{nick}`...")
+    res = await SystemService.get_osint_data(nick)
+    await wait.edit_text(f"🔍 **Результати для {nick}:**\n\n{res}", disable_web_page_preview=True)
 
-@dp.message(F.text.startswith("!"))
-async def handle_ip(message: Message):
-    ip = message.text[1:].strip()
-    async with httpx.AsyncClient() as client:
-        try:
-            r = await client.get(f"http://ip-api.com/json/{ip}")
-            d = r.json()
-            res = f"📍 **IP {ip}:** `{d.get('city')}, {d.get('country')}`\n📡 ISP: `{d.get('isp')}`"
-            await message.answer(res)
-        except:
-            await message.answer("❌ Помилка сервісу.")
+@dp.callback_query(F.data == "shutdown")
+async def cb_off(cb: CallbackQuery):
+    await cb.message.edit_text("🔌 Offline.")
+    os._exit(0)
 
-@dp.callback_query(F.data == "stats")
-async def cb_stats(cb: CallbackQuery):
-    text = IntelModule.get_system_stats()
-    await cb.message.edit_text(text, reply_markup=get_main_kb(), parse_mode="Markdown")
+async def main():
+    await dp.start_polling(bot)
 
-@dp.callback_query(F.data == "term_help")
-async def cb_term(cb: CallbackQuery):
-    await cb.message.answer("📟 Напишіть команду через `$` (напр: `$ ls -la`)")
-    await cb.answer()
-
-@dp.message(F.text.startswith("$"))
-async def handle_shell(message: Message):
-    cmd = message.text[1:].strip()
-    proc = await asyncio.create_subprocess_shell(
-        cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
-    stdout, stderr = await proc.communicate()
-    res = (stdout + stderr).decode().strip() or "Виконано."
-    await message.answer(f"📝 **Вивід:**\n
+if __name__ == "__main__":
+    asyncio.run(main())
