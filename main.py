@@ -516,4 +516,101 @@ async def cb_back(cb: CallbackQuery):
     u = get_user(uid)
     style_name, _ = STYLES.get(u["style"], STYLES["default"])
     await cb.message.edit_text(
-     
+        f"⚡ *Живчик* на зв'язку! {get_time_greeting()}\n"
+        f"Стиль: *{style_name}* | Вибери режим 👇",
+        reply_markup=main_kb(uid), parse_mode="Markdown"
+    )
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("mode_"))
+async def cb_mode(cb: CallbackQuery):
+    uid = cb.from_user.id
+    mode = cb.data.replace("mode_", "")
+    u = get_user(uid)
+    u["mode"] = mode
+    save_user(uid)
+    names = {"chat": "💬 Чат", "translate": "🌍 Переклад", "summarize": "📋 Підсумок"}
+    hints = {"chat": "Пиши що хочеш 🔥", "translate": "Кидай текст — переведу 🌍", "summarize": "Давай текст — зроблю підсумок 📋"}
+    await cb.message.edit_text(
+        f"🟢 *{names[mode]}*\n\n{hints[mode]}",
+        reply_markup=main_kb(uid), parse_mode="Markdown"
+    )
+    await cb.answer()
+
+@dp.callback_query(F.data == "clear")
+async def cb_clear(cb: CallbackQuery):
+    uid = cb.from_user.id
+    u = get_user(uid)
+    u["history"] = []
+    save_user(uid)
+    await cb.answer("✅ Пам'ять очищена!")
+    await cb.message.edit_text("🗑 *Пам'ять очищена* ✨", reply_markup=main_kb(uid), parse_mode="Markdown")
+
+@dp.message(F.photo)
+async def handle_photo(message: Message):
+    uid = message.from_user.id
+    thinking = await message.answer("🔍 Дивлюсь...")
+    stop = asyncio.Event()
+    anim = asyncio.create_task(animate(thinking, stop))
+    try:
+        photo = message.photo[-1]
+        file = await bot.get_file(photo.file_id)
+        data = await bot.download_file(file.file_path)
+        result = await analyze_photo(data.read(), message.caption or "")
+        u = get_user(uid)
+        u["stats"]["photos"] += 1
+        u["stats"]["total"] += 1
+        save_user(uid)
+        last_reply[uid] = result
+    finally:
+        stop.set(); anim.cancel()
+    await thinking.edit_text(f"🖼 *Ось що бачу:*\n\n{result}", parse_mode="Markdown", reply_markup=voice_kb())
+
+@dp.message(F.text & ~F.text.startswith("/"))
+async def handle_text(message: Message):
+    uid = message.from_user.id
+    text = message.text
+
+    # Обробка очікуваного вводу (ім'я/місто)
+    if uid in waiting_input:
+        field = waiting_input.pop(uid)
+        u = get_user(uid)
+        u[field] = text.strip()
+        save_user(uid)
+        labels = {"name": "Ім'я", "city": "Місто"}
+        await message.answer(f"✅ *{labels[field]}* збережено: *{text.strip()}*", reply_markup=main_kb(uid), parse_mode="Markdown")
+        return
+
+    u = get_user(uid)
+    mode = u["mode"]
+    icons = {"chat": "💬", "translate": "🌍", "summarize": "📋"}
+
+    thinking = await message.answer(f"{icons.get(mode,'⚡')} Обробляю...")
+    stop = asyncio.Event()
+    anim = asyncio.create_task(animate(thinking, stop))
+
+    try:
+        reply = await ask_groq(uid, text)
+        if mode == "translate": u["stats"]["translates"] += 1
+        elif mode == "summarize": u["stats"]["summaries"] += 1
+        save_user(uid)
+        last_reply[uid] = reply
+    finally:
+        stop.set(); anim.cancel()
+
+    try:
+        await thinking.edit_text(reply, reply_markup=voice_kb())
+    except Exception:
+        await thinking.delete()
+        await message.answer(reply, reply_markup=voice_kb())
+
+async def main():
+    await bot.set_my_commands([BotCommand(command="start", description="⚡ Запустити Живчика")])
+    logger.info("Живчик v4.0 запущено!")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Живчик зупинено.")
