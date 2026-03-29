@@ -26,7 +26,7 @@ if not BOT_TOKEN or not GROQ_KEY:
 GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_HEADERS = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
 MODEL        = "llama-3.3-70b-versatile"
-VISION_MODEL = "llama-3.2-11b-vision-preview"
+VISION_MODEL = "llama-3.2-11b-vision-instruct"
 TTS_URL      = "https://api.groq.com/openai/v1/audio/speech"
 DATA_FILE    = "zhyvchyk_data.json"
 MAX_HISTORY  = 14
